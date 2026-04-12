@@ -51,6 +51,7 @@ def _validate_api_key(api_key: str) -> str:
         result = client.api_keys.get_current_key_metadata()
 
     label: str = result.data.label
+
     return label
 
 

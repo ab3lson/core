@@ -10,11 +10,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 import openai
+from openai._streaming import AsyncStream
 from openai.types.chat import (
     ChatCompletionAssistantMessageParam,
+    ChatCompletionChunk,
     ChatCompletionContentPartImageParam,
     ChatCompletionFunctionToolParam,
-    ChatCompletionMessage,
     ChatCompletionMessageFunctionToolCallParam,
     ChatCompletionMessageParam,
     ChatCompletionSystemMessageParam,
@@ -148,25 +149,54 @@ def _decode_tool_arguments(arguments: str) -> Any:
         raise HomeAssistantError(f"Unexpected tool argument response: {err}") from err
 
 
-async def _transform_response(
-    message: ChatCompletionMessage,
+async def _transform_stream(
+    stream: AsyncStream[ChatCompletionChunk],
 ) -> AsyncGenerator[conversation.AssistantContentDeltaDict]:
-    """Transform the OpenRouter message to a ChatLog format."""
-    data: conversation.AssistantContentDeltaDict = {
-        "role": message.role,
-        "content": message.content,
-    }
-    if message.tool_calls:
-        data["tool_calls"] = [
-            llm.ToolInput(
-                id=tool_call.id,
-                tool_name=tool_call.function.name,
-                tool_args=_decode_tool_arguments(tool_call.function.arguments),
-            )
-            for tool_call in message.tool_calls
-            if tool_call.type == "function"
-        ]
-    yield data
+    """Transform an OpenAI chat completion stream into HA ChatLog format."""
+    # tool call accumulator: index -> {id, name, arguments}
+    tool_calls: dict[int, dict[str, str]] = {}
+    role_yielded = False
+
+    async for chunk in stream:
+        if not chunk.choices:
+            continue
+
+        delta = chunk.choices[0].delta
+
+        if not role_yielded:
+            yield {"role": "assistant", "content": ""}
+            role_yielded = True
+
+        if delta.content:
+            yield {"content": delta.content}
+
+        if delta.tool_calls:
+            for tc_delta in delta.tool_calls:
+                idx = tc_delta.index
+                if idx not in tool_calls:
+                    tool_calls[idx] = {"id": "", "name": "", "arguments": ""}
+                if tc_delta.id:
+                    tool_calls[idx]["id"] = tc_delta.id
+                if tc_delta.function:
+                    if tc_delta.function.name:
+                        tool_calls[idx]["name"] += tc_delta.function.name
+                    if tc_delta.function.arguments:
+                        tool_calls[idx]["arguments"] += tc_delta.function.arguments
+
+    if not role_yielded:
+        raise HomeAssistantError("API returned empty response")
+
+    if tool_calls:
+        yield {
+            "tool_calls": [
+                llm.ToolInput(
+                    id=tc["id"],
+                    tool_name=tc["name"],
+                    tool_args=_decode_tool_arguments(tc["arguments"]),
+                )
+                for tc in tool_calls.values()
+            ]
+        }
 
 
 async def async_prepare_files_for_prompt(
@@ -295,22 +325,16 @@ class OpenRouterEntity(Entity):
 
         for _iteration in range(MAX_TOOL_ITERATIONS):
             try:
-                result = await client.chat.completions.create(**model_args)
+                stream = await client.chat.completions.create(**model_args, stream=True)
             except openai.OpenAIError as err:
                 LOGGER.error("Error talking to API: %s", err)
                 raise HomeAssistantError("Error talking to API") from err
-
-            if not result.choices:
-                LOGGER.error("API returned empty choices")
-                raise HomeAssistantError("API returned empty response")
-
-            result_message = result.choices[0].message
 
             model_args["messages"].extend(
                 [
                     msg
                     async for content in chat_log.async_add_delta_content_stream(
-                        self.entity_id, _transform_response(result_message)
+                        self.entity_id, _transform_stream(stream)
                     )
                     if (msg := _convert_content_to_chat_message(content))
                 ]

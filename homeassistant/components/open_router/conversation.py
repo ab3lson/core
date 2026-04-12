@@ -31,6 +31,7 @@ async def async_setup_entry(
 class OpenRouterConversationEntity(OpenRouterEntity, conversation.ConversationEntity):
     """OpenRouter conversation agent."""
 
+    _attr_supports_streaming = True
     _attr_name = None
 
     def __init__(self, entry: OpenRouterConfigEntry, subentry: ConfigSubentry) -> None:

@@ -4,14 +4,13 @@ import datetime
 from unittest.mock import AsyncMock, patch
 
 from freezegun import freeze_time
-from openai.types import CompletionUsage
-from openai.types.chat import (
-    ChatCompletion,
-    ChatCompletionMessage,
-    ChatCompletionMessageFunctionToolCall,
+from openai.types.chat import ChatCompletionChunk
+from openai.types.chat.chat_completion_chunk import (
+    Choice as ChunkChoice,
+    ChoiceDelta,
+    ChoiceDeltaToolCall,
+    ChoiceDeltaToolCallFunction,
 )
-from openai.types.chat.chat_completion import Choice
-from openai.types.chat.chat_completion_message_function_tool_call_param import Function
 import pytest
 from syrupy.assertion import SnapshotAssertion
 
@@ -22,6 +21,7 @@ from homeassistant.helpers import entity_registry as er, intent
 from homeassistant.helpers.llm import ToolInput
 
 from . import setup_integration
+from .conftest import make_stream
 
 from tests.common import MockConfigEntry, snapshot_platform
 from tests.components.conversation import MockChatLog, mock_chat_log  # noqa: F401
@@ -116,17 +116,8 @@ async def test_empty_api_response(
     """Test that an empty choices response raises HomeAssistantError."""
     await setup_integration(hass, mock_config_entry)
 
-    mock_openai_client.chat.completions.create = AsyncMock(
-        return_value=ChatCompletion(
-            id="chatcmpl-1234567890ABCDEFGHIJKLMNOPQRS",
-            choices=[],
-            created=1700000000,
-            model="gpt-3.5-turbo-0613",
-            object="chat.completion",
-            system_fingerprint=None,
-            usage=CompletionUsage(completion_tokens=0, prompt_tokens=8, total_tokens=8),
-        )
-    )
+    # Empty stream — triggers "API returned empty response"
+    mock_openai_client.chat.completions.create = make_stream()
 
     result = await conversation.async_converse(
         hass,
@@ -194,60 +185,55 @@ async def test_function_call(
         }
     )
 
-    mock_openai_client.chat.completions.create.side_effect = (
-        ChatCompletion(
-            id="chatcmpl-1234567890ABCDEFGHIJKLMNOPQRS",
+    async def _tool_call_stream():
+        yield ChatCompletionChunk(
+            id="chatcmpl-tool",
             choices=[
-                Choice(
-                    finish_reason="tool_calls",
-                    index=0,
-                    message=ChatCompletionMessage(
-                        content=None,
+                ChunkChoice(
+                    delta=ChoiceDelta(
                         role="assistant",
-                        function_call=None,
+                        content=None,
                         tool_calls=[
-                            ChatCompletionMessageFunctionToolCall(
+                            ChoiceDeltaToolCall(
+                                index=0,
                                 id="call_call_1",
-                                function=Function(
-                                    arguments='{"param1":"call1"}',
+                                function=ChoiceDeltaToolCallFunction(
                                     name="test_tool",
+                                    arguments='{"param1":"call1"}',
                                 ),
                                 type="function",
                             )
                         ],
                     ),
+                    finish_reason="tool_calls",
+                    index=0,
                 )
             ],
             created=1700000000,
             model="gpt-4-1106-preview",
-            object="chat.completion",
-            system_fingerprint=None,
-            usage=CompletionUsage(
-                completion_tokens=9, prompt_tokens=8, total_tokens=17
-            ),
-        ),
-        ChatCompletion(
-            id="chatcmpl-1234567890ZYXWVUTSRQPONMLKJIH",
+            object="chat.completion.chunk",
+        )
+
+    async def _final_stream():
+        yield ChatCompletionChunk(
+            id="chatcmpl-final",
             choices=[
-                Choice(
+                ChunkChoice(
+                    delta=ChoiceDelta(
+                        role="assistant",
+                        content="I have successfully called the function",
+                    ),
                     finish_reason="stop",
                     index=0,
-                    message=ChatCompletionMessage(
-                        content="I have successfully called the function",
-                        role="assistant",
-                        function_call=None,
-                        tool_calls=None,
-                    ),
                 )
             ],
             created=1700000000,
             model="gpt-4-1106-preview",
-            object="chat.completion",
-            system_fingerprint=None,
-            usage=CompletionUsage(
-                completion_tokens=9, prompt_tokens=8, total_tokens=17
-            ),
-        ),
+            object="chat.completion.chunk",
+        )
+
+    mock_openai_client.chat.completions.create = AsyncMock(
+        side_effect=[_tool_call_stream(), _final_stream()]
     )
 
     result = await conversation.async_converse(

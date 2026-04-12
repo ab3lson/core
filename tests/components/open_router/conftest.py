@@ -5,9 +5,8 @@ import json
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from openai.types import CompletionUsage
-from openai.types.chat import ChatCompletion, ChatCompletionMessage
-from openai.types.chat.chat_completion import Choice
+from openai.types.chat import ChatCompletionChunk
+from openai.types.chat.chat_completion_chunk import Choice as ChunkChoice, ChoiceDelta
 from openrouter.components.model import Model
 import pytest
 
@@ -100,35 +99,34 @@ def mock_config_entry(
     )
 
 
+def make_stream(*contents: str | None) -> AsyncMock:
+    """Return an AsyncMock that yields ChatCompletionChunk objects for each content string."""
+
+    async def _stream():
+        for content in contents:
+            yield ChatCompletionChunk(
+                id="chatcmpl-stream",
+                choices=[
+                    ChunkChoice(
+                        delta=ChoiceDelta(role="assistant", content=content),
+                        finish_reason=None,
+                        index=0,
+                    )
+                ],
+                created=1700000000,
+                model="gpt-3.5-turbo-0613",
+                object="chat.completion.chunk",
+            )
+
+    return AsyncMock(return_value=_stream())
+
+
 @pytest.fixture
 async def mock_openai_client() -> AsyncGenerator[AsyncMock]:
     """Initialize integration."""
     with patch("homeassistant.components.open_router.AsyncOpenAI") as mock_client:
         client = mock_client.return_value
-        client.chat.completions.create = AsyncMock(
-            return_value=ChatCompletion(
-                id="chatcmpl-1234567890ABCDEFGHIJKLMNOPQRS",
-                choices=[
-                    Choice(
-                        finish_reason="stop",
-                        index=0,
-                        message=ChatCompletionMessage(
-                            content="Hello, how can I help you?",
-                            role="assistant",
-                            function_call=None,
-                            tool_calls=None,
-                        ),
-                    )
-                ],
-                created=1700000000,
-                model="gpt-3.5-turbo-0613",
-                object="chat.completion",
-                system_fingerprint=None,
-                usage=CompletionUsage(
-                    completion_tokens=9, prompt_tokens=8, total_tokens=17
-                ),
-            )
-        )
+        client.chat.completions.create = make_stream("Hello, how can I help you?")
         yield client
 
 
